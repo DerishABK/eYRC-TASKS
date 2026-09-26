@@ -1,0 +1,16 @@
+{
+    "generate": true,
+    "os_info": {
+        "name": "Windows",
+        "version": "10.0.21996",
+        "machine": "AMD64"
+    },
+    "python_version": "3.10.21",
+    "schedule": "22:R,53:L",
+    "rows": 2400,
+    "duration": 120.0,
+    "lane_changes": 2,
+    "meta": {
+        "evaluation_time": 50.39262652397156
+    }
+}
