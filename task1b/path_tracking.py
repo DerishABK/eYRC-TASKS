@@ -19,10 +19,11 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          < 5761 >
+# Author List:      < Derish Abraham, Joshua Varghese, Reibin Chacko Thomas, Delvin Varghese >
 # Filename:         path_tracking.py
 # Functions:        ackermann_wheel_angles, compute_steering
+# Global variables: _integral_cte
 
 
 ####################### IMPORT MODULES #######################
@@ -48,6 +49,23 @@ WHEEL_OFFSET = 0.0275       # O: distance between kingpin axis and wheel centre.
 ##############################################################
 
 
+# --------------- Ackermann geometry constants (same as Task 1A) ---------------
+# WHEELBASE, TRACK_WIDTH, WHEEL_OFFSET are already declared above.
+
+# --------------- Stanley controller tuning constants --------------------------
+# Vehicle speed is ~0.029 m/s; Stanley term = atan(K*cte / (K_SOFT+speed)).
+# With K_STANLEY=1.5 and speed=0.03 the term saturates at MAX_STEER for any
+# cte > 0.001 m -- causing constant large yaw and oscillation.
+# Tuned for actual speed: K_SOFT ~ speed, K_STANLEY small.
+K_STANLEY = 0.3     # cross-track gain (reduced for slow vehicle)
+K_SOFT    = 0.05    # softening constant (~vehicle speed to keep term linear)
+K_I       = 0.01    # integral gain (small to avoid wind-up across lane changes)
+INTEGRAL_CLAMP = 0.10   # m·s  anti-windup: cap the accumulated integral
+
+# --------------- Persistent controller state ----------------------------------
+_integral_cte = 0.0  # accumulated cross-track error integral (NOT reset on lane change)
+
+
 def ackermann_wheel_angles(delta):
     '''
     Purpose:
@@ -67,8 +85,20 @@ def ackermann_wheel_angles(delta):
     `right_wheel_angle` : [ float ]  angle for the right front wheel, radians
     '''
 
-    left_wheel_angle = 0
-    right_wheel_angle = 0
+    if delta == 0:
+        return 0.0, 0.0
+
+    # Effective half-track: kingpin axis is inset by WHEEL_OFFSET from wheel centre
+    half_track = (TRACK_WIDTH / 2) - WHEEL_OFFSET
+    tangent = math.tan(delta)
+
+    # Ackermann geometry: each wheel steers around the same instantaneous centre.
+    # Inner wheel (left when turning left) steers more sharply than the outer.
+    left_tangent  = tangent / (1 - half_track * tangent / WHEELBASE)
+    right_tangent = tangent / (1 + half_track * tangent / WHEELBASE)
+
+    left_wheel_angle  = math.atan(left_tangent)
+    right_wheel_angle = math.atan(right_tangent)
 
     return left_wheel_angle, right_wheel_angle
 
@@ -100,18 +130,51 @@ def compute_steering(target_y, current_values):
         Steering angle in radians. Positive turns the vehicle left, which on
         this road means toward SMALLER y.
 
-    NOTE:
+    Controller:
     ---
-    While you are debugging, printing or plotting from in here is fine - do
-    whatever helps you see what your controller is doing.
+    Stanley method:
+        steering = heading_error + arctan(K_STANLEY * cte / (K_SOFT + speed))
+    Plus a small integral term to kill steady-state offset:
+        steering += K_I * integral_cte
 
-    Before you submit, take all of it back out. The submitted function must
-    ONLY compute and return the steering angle: no print(), no plotting, and
-    no commanding the simulator - the control loop below does all of that.
+    Sign convention:
+        cte = current_y - target_y
+        A positive cte means the vehicle is too far in the +y direction,
+        so a positive (left-turn) correction is required. ✓
     '''
 
-    steering = 0
-    return steering
+    global _integral_cte
+
+    # --- Extract measurements ---
+    current_y = current_values["y"]
+    yaw       = current_values["yaw"]
+    speed     = current_values["speed"]
+    dt        = current_values["dt"]
+
+    # --- Cross-track error ---
+    # Positive cte → vehicle is right of target → need to steer left (positive steering). ✓
+    cte = current_y - target_y
+
+    # --- Integrate cross-track error for steady-state correction ---
+    _integral_cte += cte * dt
+    # Anti-windup: clamp integral so it cannot drive steering past the limit
+    _integral_cte = max(-INTEGRAL_CLAMP, min(INTEGRAL_CLAMP, _integral_cte))
+
+    # --- Heading error ---
+    # Road runs along world -x, so desired yaw = 0.  A positive yaw means the
+    # nose is pointing toward +y (too far right), so we need a left correction.
+    heading_error = -yaw
+
+    # --- Stanley lateral correction term ---
+    stanley_term = math.atan2(K_STANLEY * cte, K_SOFT + speed)
+
+    # --- Integral term ---
+    integral_term = K_I * _integral_cte
+
+    # --- Combined steering command ---
+    steering = heading_error + stanley_term + integral_term
+
+    return float(steering)
 
 
 ##############################################################
