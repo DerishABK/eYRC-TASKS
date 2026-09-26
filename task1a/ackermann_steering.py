@@ -19,11 +19,11 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          < 5761 >
+# Author List:      < Derish Abraham,Joshua Varghese,Reibin Chacko Thomas,Delvin Varghese>
 # Filename:         ackermann_steering.py
 # Functions:        ackermann_wheel_angles
-# Global variables: < List any global variables you add, "None" if you add none >
+# Global variables: < "None" >
 
 
 ####################### IMPORT MODULES #######################
@@ -69,6 +69,22 @@ def ackermann_wheel_angles(delta):
     '''
 
 
+    if delta == 0:
+        return 0.0, 0.0
+
+    half_track = (TRACK_WIDTH / 2) - WHEEL_OFFSET
+    tangent = math.tan(delta)
+
+    left_tangent = tangent / (
+        1 - half_track * tangent / WHEELBASE
+    )
+    right_tangent = tangent / (
+        1 + half_track * tangent / WHEELBASE
+    )
+
+    left_angle = math.atan(left_tangent)
+    right_angle = math.atan(right_tangent)
+
     return left_angle, right_angle
 
 
@@ -81,7 +97,7 @@ def ackermann_wheel_angles(delta):
 
 if __name__ == "__main__":
 
-    test_angles = np.arange(-0.35, 0.35, 0.05)
+    test_angles = np.arange(-0.523, 0.523, 0.05)
 
     for d in test_angles:
         left, right = ackermann_wheel_angles(d)
