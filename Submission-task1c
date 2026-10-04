@@ -1,0 +1,60 @@
+The two components
+Component	Marks	How it is scored
+Lane identification	20	Fraction of frames where lane matches the ground truth
+Lane centre	30	How close center_x is to the true lane centre
+
+Lane centre tolerance. A lane is roughly 315 px wide in the frame, so your center_x does not have to be exact:
+Error against the ground truth	Credit
+within 30 px	full
+within 60 px	half
+beyond 60 px	none
+the lane for that frame was wrong	none
+
+That last row matters: the centre of the wrong lane is not the centre of your lane, however close the number looks. Get the lane right first.
+
+Frames you give up on still count. Returning "unknown" / -1 on a frame where the lane was clearly visible scores zero on both components, the same as a wrong answer. Reporting failure honestly costs you nothing extra and makes your own debugging far easier
+
+keep in mind you can check this:
+Submission Procedure
+1. Install the evaluation tool
+which is already present ! skip this
+Run everything inside your NV_<Team-ID> environment - the one holding Python 3.10, NumPy and OpenCV.
+Terminal window
+
+conda activate NV_<Team-ID>
+
+2. Run the evaluation
+
+Run it from task1c/, the folder holding your completed lane_detection.py with the clips beside it in public/:
+
+task1c/
+├── lane_detection.py
+└── public/
+    ├── clip_01.mp4
+    └── …
+
+The skipped column is the ambiguous frames - mid lane-change, or the divider out of view - which are excluded for everyone and cost you nothing.
+Terminal window
+
+eyantra-autoeval evaluate --year 2026 --theme NV --task 1c
+
+The tool finds your lane_detection.py and the dataset, checks every clip is 640 x 480, then calls your detect_lane() on every frame and compares the output against the ground truth. It prints a per-clip breakdown and your public-set score:
+
+------------------------------------------------------------------------------
+clip              scored  skipped  lane ok  centre ok  mean err
+------------------------------------------------------------------------------
+clip_01.mp4          200        0      200      200.0      0.2px
+...
+------------------------------------------------------------------------------
+TOTAL               3708      292     3547     3223.0     11.8px
+------------------------------------------------------------------------------
+
+  Lane identification :  95.7%  ( 90.2% after the 55.5% chance floor)  -> 18.05 / 20
+  Lane centre         :  86.9%  -> 26.08 / 30
+  PUBLIC-SET TOTAL    : 44.13 / 50
+
+If it cannot find your script or the clips it will ask for the path. It writes a result file such as result-2026-NV-1C-20260907.json into the directory you ran it from.
+
+Run it on the unmodified boilerplate
+
+The tool imports your detect_lane() directly. If you renamed the file or the function, changed the keys of the returned dictionary, or left a cv2.imshow() / cv2.waitKey() inside detect_lane(), the run will fail or hang and no result file is written.

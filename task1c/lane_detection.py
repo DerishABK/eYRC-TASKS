@@ -19,11 +19,11 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          NV_5761
+# Author List:      Derish Abraham
 # Filename:         lane_detection.py
 # Functions:        detect_lane
-# Global variables: < List any global variables you add, "None" if you add none >
+# Global variables: None
 
 
 ####################### IMPORT MODULES #######################
@@ -91,15 +91,92 @@ def detect_lane(frame):
     function - see draw_overlay() and process_video() below.
     '''
 
+    height, width = frame.shape[:2]
     center_x = -1
     lane = LANE_UNKNOWN
 
-    #################### ADD YOUR CODE HERE ####################
-    # 1. Isolate the lane markings in `frame`
-    # 2. Work out which two markings bracket the vehicle
-    # 3. Compute the x-pixel of the lane centre   ->  center_x
-    # 4. Decide which lane the vehicle is in      ->  lane
-    ############################################################
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    yellow_mask = (
+        (hsv[:, :, 0] >= 15)
+        & (hsv[:, :, 0] <= 40)
+        & (hsv[:, :, 1] >= 100)
+        & (hsv[:, :, 2] >= 100)
+    )
+    white_mask = (
+        (gray >= 180)
+        & (hsv[:, :, 1] <= 80)
+        & (hsv[:, :, 2] >= 180)
+    )
+
+    y_start = int(0.52 * height)
+    y_end = int(0.86 * height)
+    reference_y = int(0.62 * height)
+    frame_center = width / 2.0
+
+    def fit_marking(mask, side=None):
+        observations = []
+        for y in range(y_start, y_end, 2):
+            xs = np.flatnonzero(mask[y])
+            if xs.size == 0:
+                continue
+
+            runs = np.split(xs, np.flatnonzero(np.diff(xs) > 2) + 1)
+            runs = [run for run in runs if run.size >= 3]
+            if side is None:
+                if runs:
+                    selected = max(runs, key=lambda run: run.size)
+                else:
+                    continue
+            else:
+                eligible = [
+                    run for run in runs
+                    if (float(np.mean(run)) - frame_center) * side > 0
+                ]
+                if not eligible:
+                    continue
+                selected = min(
+                    eligible,
+                    key=lambda run: abs(float(np.mean(run)) - frame_center),
+                )
+            observations.append((y, float(np.mean(selected))))
+
+        if len(observations) < 5:
+            return None
+
+        ys = np.asarray([point[0] for point in observations], dtype=np.float64)
+        xs = np.asarray([point[1] for point in observations], dtype=np.float64)
+        degree = 2 if len(observations) >= 8 else 1
+        keep = np.ones(len(observations), dtype=bool)
+        for _ in range(3):
+            coefficients = np.polyfit(ys[keep], xs[keep], degree)
+            residuals = xs - np.polyval(coefficients, ys)
+            median_residual = np.median(residuals[keep])
+            mad = np.median(np.abs(residuals[keep] - median_residual))
+            limit = max(8.0, 3.0 * 1.4826 * mad)
+            updated = np.abs(residuals - median_residual) <= limit
+            if updated.sum() < degree + 1 or np.array_equal(updated, keep):
+                break
+            keep = updated
+
+        coefficients = np.polyfit(ys[keep], xs[keep], degree)
+        return float(np.polyval(coefficients, reference_y))
+
+    yellow_x = fit_marking(yellow_mask)
+    if yellow_x is not None:
+        white_side = -1 if yellow_x > frame_center else 1
+        white_x = fit_marking(white_mask, white_side)
+        if white_x is not None:
+            lane_width = abs(white_x - yellow_x)
+            markings_bracket_vehicle = (
+                (yellow_x - frame_center) * (white_x - frame_center) < 0
+            )
+            if lane_width >= 0.15 * width and markings_bracket_vehicle:
+                center_x = int(round((yellow_x + white_x) / 2.0))
+                if white_x > frame_center + 0.015 * width:
+                    lane = LANE_LEFT
+                elif white_x < frame_center - 0.015 * width:
+                    lane = LANE_RIGHT
 
     return {"center_x": center_x, "lane": lane}
 
