@@ -1,0 +1,89 @@
+
+Lane Detection
+The Problem
+
+A vehicle with a forward-facing camera has to work out three things from each frame it receives:
+
+    Where the lane markings are.
+    Where the centre of its lane is.
+    Which lane it is in.
+
+The arena gives you two markings: a dashed white centre line dividing the two lanes, and a solid yellow boundary line at the outer edge of the road.
+
+Detecting the lane is not the end goal. The pipeline has to end in a value the vehicle can steer on - something that tells it how to correct its path, not just an image with the lane drawn over it.
+
+The arena has turns
+
+Ask of every method you consider: what does this return when the lane curves? Anything that can only describe a straight line will answer a curve with a chord through it. The other trap is that the centre line is dashed, so your detector cannot assume continuous evidence.
+Approach 1 - Bird’s Eye View
+
+The lane markings all lie on the flat ground plane, so a single homography relates the camera image to an overhead view of the road. Warp by its inverse and you get a top-down image - Inverse Perspective Mapping.
+Step	Look up
+Isolate the white and yellow markings by colour	HSV, cv2.inRange
+Warp to a top-down view	cv2.getPerspectiveTransform, cv2.warpPerspective
+Find which pixels belong to which line	column histogram, sliding window
+Fit a curve through each line	np.polyfit, second order
+Compute the offset and label the lane	Your own logic
+
+Why it is worth the warp: parallel markings stay parallel, pixels convert to real distance by a constant scale, and a curved marking becomes a well-behaved function of the vertical axis which fits x=ay2+by+cx=ay2+by+c, not y=f(x)y=f(x).
+
+The hard parts are choosing the four source points, which is a one-time calibration that every downstream number inherits, and keeping the dashed line’s patchy evidence from breaking the search.
+Approach 2 - Working in the Camera View
+
+Skip the warp and find the markings directly in the perspective image. Faster to get running, no calibration.
+
+Mask a region of interest, run Canny, and pass the edges to a Hough line transform where every edge pixel votes for the lines through it, so a dashed line still accumulates one strong peak. cv2.HoughLinesP returns segments you can group by slope sign.
+
+The catch is in the name: on a curve it returns fragmented chords. Either run Hough within horizontal strips and treat the road as piecewise-linear, or use it only to locate the markings and then fit a curve through the pixels.
+
+Fitting a curve instead
+
+Skip line detection altogether: reduce the mask to points - say the marking centroid in each horizontal band - and fit a polynomial or spline through them, with no straight-line assumption anywhere.
+
+One stray cluster of bright pixels is enough to pull a least-squares fit off the marking. RANSAC discards such outliers instead of averaging them in.
+Other Directions
+
+Once the basics work, these are worth a look:
+
+    Use the lane you found in the previous frame as the starting point for the next one, instead of searching the whole image again.
+    Work out how sharply the road is turning from the curve you fitted, so the vehicle can start steering into the bend early.
+    Deep learning models that label the lane pixels directly, which is how real self-driving systems do it.
+
+Resources
+
+Colour and edges
+
+    Changing Colorspaces - OpenCV
+    Image Thresholding - OpenCV
+    Morphological Transformations - OpenCV
+    Canny Edge Detection - OpenCV
+
+Hough transform
+
+    Hough Line Transform - OpenCV
+
+Pop out
+Open on YouTube ↗
+
+Perspective transform
+
+    Geometric Transformations of Images - OpenCV
+    4 Point OpenCV getPerspectiveTransform Example - PyImageSearch
+    Bird’s Eye View Transformation - Computer Vision Lab - how to reason about the source points
+
+Curve fitting and RANSAC
+
+    numpy.polyfit
+    scipy.interpolate.splprep and splev
+    Robust linear model estimation using RANSAC - scikit-learn
+
+Pop out
+Open on YouTube ↗
+
+Full pipelines
+
+Written for real roads, not this arena - references for the technique, not something to copy.
+
+    The Ultimate Guide to Real-Time Lane Detection Using OpenCV - Automatic Addison - bird’s eye view, histogram and sliding windows
+    Hands-On Tutorial on Real-Time Lane Detection using OpenCV - Analytics Vidhya - the camera-view route
+
