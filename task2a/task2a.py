@@ -54,6 +54,122 @@ STOP_SIGNAL = 'NV_stop'
 ############### ADD YOUR IMPLEMENTATION HERE #################
 ##############################################################
 
+# Values from the supplied Task 1A/1B vehicle geometry and drive setup.
+_WHEELBASE = 0.120
+_TRACK_WIDTH = 0.110
+_WHEEL_OFFSET = 0.0275
+_CRUISE_SPEED = 1.3
+_RECOVERY_SPEED = 0.35
+
+# Camera segmentation/search settings. Lane position itself is always detected
+# from the two painted markings in the current camera image.
+_YELLOW_LOWER = np.array([15, 100, 100], dtype=np.uint8)
+_YELLOW_UPPER = np.array([40, 255, 255], dtype=np.uint8)
+_WHITE_SATURATION_MAX = 80
+_WHITE_VALUE_MIN = 180
+_ROI_TOP = 0.30
+_ROI_BOTTOM = 0.90
+_LOOKAHEAD_FAR = 0.40
+_LOOKAHEAD_NEAR = 0.80
+
+# Camera-space Stanley tuning. Cross-track error is expressed as a fraction of
+# the observed lane width; heading error is the fitted lane tangent angle.
+_STANLEY_K = 1.35
+_STANLEY_SOFTENING = 0.20
+_MAX_STEER = np.deg2rad(30.0)
+_FILTER_ALPHA = 0.30
+_MAX_STEER_STEP = 0.04
+
+# Per-run state: the previous boundary fit keeps dashed-marking search on the
+# same lane, and the controller filters frame-to-frame image noise.
+_tracked_markings = None
+_previous_lane_center = None
+_filtered_cte = None
+_filtered_heading = None
+_last_steering = 0.0
+_last_speed = _CRUISE_SPEED
+_lost_frames = 0
+
+
+def _fit_marking(mask, frame_center, y_start, y_end, y_far, y_near,
+                 side_hint, previous_fit=None):
+    """Track a paint line near-to-far, bridging gaps in the dashed divider."""
+    observations = []
+    span = max(1.0, float(y_near - y_far))
+    recent = []
+    start_y = min(y_near, y_end - 1)
+    for y in range(start_y, y_start - 1, -2):
+        xs = np.flatnonzero(mask[y])
+        if previous_fit is not None:
+            fraction = (y - y_far) / span
+            expected_x = previous_fit[0] + fraction * (previous_fit[1] - previous_fit[0])
+        elif len(recent) >= 2:
+            y0, x0 = recent[-2]
+            y1, x1 = recent[-1]
+            expected_x = x1 + (x1 - x0) / max(1.0, y1 - y0) * (y - y1)
+        elif recent:
+            expected_x = recent[-1][1]
+        else:
+            expected_x = frame_center
+
+        if not xs.size:
+            continue
+        runs = np.split(xs, np.flatnonzero(np.diff(xs) > 2) + 1)
+        runs = [run for run in runs
+                if 2 <= run.size <= max(8, int(0.10 * mask.shape[1]))]
+        if not runs:
+            continue
+
+        def run_score(run):
+            x = float(np.mean(run))
+            # The side hint seeds the first observed paint segment. Once
+            # tracking starts, continuity takes over so bends may cross x=mid.
+            wrong_side = (not recent and previous_fit is None and side_hint and
+                          (x - frame_center) * side_hint < 0)
+            return abs(x - expected_x) + (0.20 * mask.shape[1] if wrong_side else 0.0)
+
+        run = min(runs, key=run_score)
+        x = float(np.mean(run))
+        if recent and abs(x - expected_x) > 0.20 * mask.shape[1]:
+            continue
+        observations.append((y, x))
+        recent.append((y, x))
+        if len(recent) > 2:
+            recent.pop(0)
+
+    if len(observations) < 5:
+        return None
+    ys = np.asarray([point[0] for point in observations], dtype=np.float64)
+    xs = np.asarray([point[1] for point in observations], dtype=np.float64)
+    degree = 2 if len(observations) >= 8 else 1
+    keep = np.ones(len(observations), dtype=bool)
+    for _ in range(3):
+        coefficients = np.polyfit(ys[keep], xs[keep], degree)
+        residuals = xs - np.polyval(coefficients, ys)
+        median = np.median(residuals[keep])
+        mad = np.median(np.abs(residuals[keep] - median))
+        limit = max(6.0, 3.5 * 1.4826 * mad)
+        updated = np.abs(residuals - median) <= limit
+        if updated.sum() < degree + 1 or np.array_equal(updated, keep):
+            break
+        keep = updated
+    coefficients = np.polyfit(ys[keep], xs[keep], degree)
+    return (float(np.polyval(coefficients, y_far)),
+            float(np.polyval(coefficients, y_near)))
+
+
+def _ackermann_wheel_angles(steering):
+    """Split the virtual steering angle into Task 1A front-wheel angles."""
+    if abs(steering) < 1e-12:
+        return 0.0, 0.0
+
+    half_track = (_TRACK_WIDTH / 2.0) - _WHEEL_OFFSET
+    tangent = np.tan(steering)
+    left = np.arctan(tangent / (1.0 - half_track * tangent / _WHEELBASE))
+    right = np.arctan(tangent / (1.0 + half_track * tangent / _WHEELBASE))
+    return float(left), float(right)
+
+
 def detect_lane(frame):
     '''
     Purpose:
@@ -93,9 +209,94 @@ def detect_lane(frame):
     on staying the correct side of the dashed line.
     '''
 
-    # ADD YOUR CODE HERE
+    global _tracked_markings, _previous_lane_center
 
-    return None
+    height, width = frame.shape[:2]
+    frame_center = width / 2.0
+    y_start = int(_ROI_TOP * height)
+    y_end = int(_ROI_BOTTOM * height)
+    y_far = int(_LOOKAHEAD_FAR * height)
+    y_near = int(_LOOKAHEAD_NEAR * height)
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    yellow = cv2.inRange(hsv, _YELLOW_LOWER, _YELLOW_UPPER)
+    white = cv2.inRange(hsv, np.array([0, 0, _WHITE_VALUE_MIN], dtype=np.uint8),
+                        np.array([179, _WHITE_SATURATION_MAX, 255], dtype=np.uint8))
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    yellow = cv2.morphologyEx(yellow, cv2.MORPH_OPEN, kernel)
+    white = cv2.morphologyEx(white, cv2.MORPH_OPEN, kernel)
+
+    def make_candidate(yellow_side, white_side, yellow_fit=None, white_fit=None):
+        if yellow_fit is None:
+            yellow_fit = _fit_marking(
+                yellow, frame_center, y_start, y_end, y_far, y_near, yellow_side)
+        if white_fit is None:
+            white_fit = _fit_marking(
+                white, frame_center, y_start, y_end, y_far, y_near, white_side)
+        if yellow_fit is None or white_fit is None:
+            return None
+        left_fit, right_fit = ((yellow_fit, white_fit) if yellow_side < 0
+                               else (white_fit, yellow_fit))
+        if left_fit[0] >= right_fit[0] or left_fit[1] >= right_fit[1]:
+            return None
+        lane_width = 0.5 * ((right_fit[0] - left_fit[0]) +
+                            (right_fit[1] - left_fit[1]))
+        if not (0.08 * width <= lane_width <= 0.65 * width):
+            return None
+
+        # These are the two virtual centerline points: each is halfway between
+        # the fitted yellow edge and dashed divider at the same lookahead row.
+        lane_far = 0.5 * (left_fit[0] + right_fit[0])
+        lane_near = 0.5 * (left_fit[1] + right_fit[1])
+        outside = max(left_fit[1] - frame_center,
+                      frame_center - right_fit[1], 0.0) / lane_width
+        score = abs(lane_near - frame_center) / lane_width + 2.0 * outside
+        return {"far": lane_far, "near": lane_near, "width": lane_width,
+                "score": score, "yellow_side": yellow_side,
+                "white_side": white_side, "yellow_fit": yellow_fit,
+                "white_fit": white_fit}
+
+    candidates = []
+    if _tracked_markings is not None:
+        yellow_side, previous_yellow, white_side, previous_white = _tracked_markings
+        yellow_fit = _fit_marking(yellow, frame_center, y_start, y_end,
+                                  y_far, y_near, 0, previous_yellow)
+        white_fit = _fit_marking(white, frame_center, y_start, y_end,
+                                 y_far, y_near, 0, previous_white)
+        tracked = make_candidate(yellow_side, white_side, yellow_fit, white_fit)
+        if tracked is not None and _previous_lane_center is not None:
+            old_far, old_near = _previous_lane_center
+            jump = (abs(tracked["near"] - old_near) +
+                    0.35 * abs(tracked["far"] - old_far)) / tracked["width"]
+            if jump <= 0.45:
+                candidates.append(tracked)
+
+    if not candidates:
+        # Reacquire only after a lost fit or a large frame-to-frame jump.
+        _tracked_markings = None
+        _previous_lane_center = None
+        for yellow_side, white_side in ((-1, 1), (1, -1)):
+            candidate = make_candidate(yellow_side, white_side)
+            if candidate is not None:
+                candidates.append(candidate)
+
+    if not candidates:
+        _tracked_markings = None
+        _previous_lane_center = None
+        return {"valid": False}
+
+    candidate = min(candidates, key=lambda item: item["score"])
+    _tracked_markings = (candidate["yellow_side"], candidate["yellow_fit"],
+                         candidate["white_side"], candidate["white_fit"])
+    _previous_lane_center = (candidate["far"], candidate["near"])
+    return {
+        "valid": True,
+        "cte": (candidate["near"] - frame_center) / candidate["width"],
+        # Positive steering is left; positive image x points right.
+        "heading_error": -float(np.arctan2(candidate["far"] - candidate["near"],
+                                            y_near - y_far)),
+        "lane_width_px": candidate["width"],
+    }
 
 
 def compute_control(detection, stop_requested):
@@ -147,9 +348,52 @@ def compute_control(detection, stop_requested):
     defensible - doing nothing is not.
     '''
 
-    # ADD YOUR CODE HERE
+    global _filtered_cte, _filtered_heading, _last_steering, _last_speed, _lost_frames
 
-    return 0.0, 0.0, 0.0
+    if stop_requested:
+        _last_speed = 0.0
+        left, right = _ackermann_wheel_angles(_last_steering)
+        return left, right, 0.0
+
+    if isinstance(detection, dict) and detection.get("valid"):
+        _lost_frames = 0
+        cte = float(detection["cte"])
+        heading_error = float(detection["heading_error"])
+
+        if _filtered_cte is None:
+            _filtered_cte = cte
+            _filtered_heading = heading_error
+        else:
+            _filtered_cte += _FILTER_ALPHA * (cte - _filtered_cte)
+            _filtered_heading += _FILTER_ALPHA * (heading_error - _filtered_heading)
+
+        speed_fraction = max(0.30, _last_speed / _CRUISE_SPEED)
+        cross_track_term = -np.arctan2(
+            _STANLEY_K * _filtered_cte,
+            _STANLEY_SOFTENING + speed_fraction)
+        requested = float(np.clip(_filtered_heading + cross_track_term,
+                                  -_MAX_STEER, _MAX_STEER))
+        steering = _last_steering + float(np.clip(
+            requested - _last_steering, -_MAX_STEER_STEP, _MAX_STEER_STEP))
+
+        # Reduce speed for large lane error or a sharper bend; the task has no
+        # lap-time target, and the wheels need time to follow the path.
+        speed = _CRUISE_SPEED / (1.0 + 1.2 * abs(steering))
+        speed = min(speed, _CRUISE_SPEED * max(0.35, 1.0 - 1.2 * abs(_filtered_cte)))
+        speed = float(max(0.35, speed))
+    else:
+        _lost_frames += 1
+        steering = _last_steering
+        # Keep moving slowly on the last safe steering command so a brief
+        # corner occlusion can reveal the markings again. Only the evaluation
+        # stop signal is allowed to command a stationary vehicle.
+        speed = (_CRUISE_SPEED * 0.5 if _lost_frames <= 2
+                 else _RECOVERY_SPEED)
+
+    _last_steering = steering
+    _last_speed = speed
+    left, right = _ackermann_wheel_angles(steering)
+    return left, right, float(speed)
 
 
 ##############################################################
