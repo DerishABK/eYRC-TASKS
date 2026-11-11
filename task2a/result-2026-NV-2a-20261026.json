@@ -1,0 +1,101 @@
+{
+    "generate": true,
+    "os_info": {
+        "name": "Linux",
+        "version": "#1 SMP PREEMPT_DYNAMIC Sun Oct 11 18:11:51 UTC 2026",
+        "machine": "x86_64"
+    },
+    "python": "3.10.21",
+    "integrity": {
+        "parsed": true,
+        "provided_missing": [],
+        "student_missing": [],
+        "forbidden_calls": []
+    },
+    "schema": 4,
+    "laps": [
+        {
+            "lane": "outer",
+            "reason": "lap complete",
+            "samples": 9311,
+            "stops_raised": 2,
+            "stops_total": 2,
+            "sim_seconds": 477.3,
+            "wall_seconds": 159.91
+        },
+        {
+            "lane": "inner",
+            "reason": "lap complete",
+            "samples": 7079,
+            "stops_raised": 2,
+            "stops_total": 2,
+            "sim_seconds": 360.45,
+            "wall_seconds": 120.38
+        }
+    ],
+    "manifest": {
+        "schema": 4,
+        "laps": [
+            {
+                "lane": "outer",
+                "reason": "lap complete",
+                "samples": 9311,
+                "stops_raised": 2,
+                "stops_total": 2,
+                "sim_seconds": 477.3,
+                "wall_seconds": 159.91
+            },
+            {
+                "lane": "inner",
+                "reason": "lap complete",
+                "samples": 7079,
+                "stops_raised": 2,
+                "stops_total": 2,
+                "sim_seconds": 360.45,
+                "wall_seconds": 120.38
+            }
+        ],
+        "integrity": {
+            "parsed": true,
+            "provided_missing": [],
+            "student_missing": [],
+            "forbidden_calls": []
+        },
+        "csv_name": "NV_Task2A_run.csv",
+        "csv_rows": 16390,
+        "csv_columns": [
+            "lane",
+            "t_sim",
+            "t_wall",
+            "x",
+            "y",
+            "speed",
+            "stop_flag"
+        ],
+        "csv_sha256": "b86f450bac21ee4a441361a7040c3e636a261ae5959153e45e308360986c5fa2",
+        "stop_at": [
+            0.33,
+            0.66
+        ],
+        "stop_hold_s": 5.0,
+        "lap_close": 0.97,
+        "script_name": "task2a.py",
+        "script_sha256": "077c6d5c91ecaedb6fa798cf98787cbf4a415e0f7709467ad8d75f29de3c472a",
+        "team": "5761",
+        "host": "fedora",
+        "os_info": {
+            "name": "Linux",
+            "version": "#1 SMP PREEMPT_DYNAMIC Sun Oct 11 18:11:51 UTC 2026",
+            "machine": "x86_64"
+        },
+        "python": "3.10.21",
+        "started_at": "2026-10-26T15:54:12+00:00",
+        "finished_at": "2026-10-26T15:58:55+00:00",
+        "wall_seconds": 282.5,
+        "nonce": "fe4d4342a8684f18b5aa2964a433e4e0"
+    },
+    "hmac": "d75024add4970d0592b44d49fc330b468cde2e6386a532aa9064d7ce78124d1a",
+    "meta": {
+        "evaluation_time": 282.79848527908325
+    }
+}

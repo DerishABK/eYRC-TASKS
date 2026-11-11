@@ -19,8 +19,8 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          NV_5761
+# Author List:      Joshua Varghese, Derish Abraham
 # Filename:         task2a.py
 # Functions:        detect_lane, compute_control
 # Global variables: < List any global variables you add, "None" if you add none >
@@ -59,7 +59,7 @@ _WHEELBASE = 0.120
 _TRACK_WIDTH = 0.110
 _WHEEL_OFFSET = 0.0275
 _CRUISE_SPEED = 1.3
-_RECOVERY_SPEED = 0.12
+_RECOVERY_SPEED = 0.25  # minimum fraction of cruise while markings are lost
 _TASK1B_SPEED_MPS = 0.029
 _TASK1B_LANE_CENTER_SPACING_M = 0.20
 _LANE_WIDTH_M = _TASK1B_LANE_CENTER_SPACING_M
@@ -174,7 +174,7 @@ def _fit_marking(mask, frame_center, y_start, y_end, y_far, y_near,
             float(np.polyval(np.polyder(coefficients), y_near)))
 
 
-def _task1c_fallback(frame, yellow_mask, white_mask):
+def _task1c_fallback(frame, yellow_mask, white_mask, lane_sides=None):
     """Use Task 1C's scored center estimate when paired tracking is occluded."""
     height, width = frame.shape[:2]
     frame_center = width / 2.0
@@ -225,11 +225,22 @@ def _task1c_fallback(frame, yellow_mask, white_mask):
                 float(np.polyval(coefficients, y_ref)),
                 float(np.polyval(np.polyder(coefficients), y_ref)))
 
-    yellow = fit(yellow_mask)
+    if lane_sides is None:
+        yellow = fit(yellow_mask)
+        if yellow is None:
+            return None
+        white_side = -1 if yellow[1] > frame_center else 1
+        yellow_side = -1 if yellow[1] < frame_center else 1
+        white = fit(white_mask, white_side)
+    else:
+        # Once a lap's lane is known, anchor recovery on that lane's yellow
+        # edge and look for its dashed divider on the opposite side. In the
+        # inner/right lane this means yellow on the car's right, divider left.
+        yellow_side, white_side = lane_sides
+        yellow = fit(yellow_mask, yellow_side)
+        white = fit(white_mask, white_side)
     if yellow is None:
         return None
-    white_side = -1 if yellow[1] > frame_center else 1
-    white = fit(white_mask, white_side)
     if white is None:
         return None
     if (yellow[1] - frame_center) * (white[1] - frame_center) >= 0:
@@ -325,7 +336,8 @@ def detect_lane(frame):
     yellow = cv2.morphologyEx(yellow, cv2.MORPH_OPEN, kernel)
     white = cv2.morphologyEx(white, cv2.MORPH_OPEN, kernel)
 
-    def make_candidate(yellow_side, white_side, yellow_fit=None, white_fit=None):
+    def make_candidate(yellow_side, white_side, yellow_fit=None, white_fit=None,
+                       require_bracket=True):
         if yellow_fit is None:
             yellow_fit = _fit_marking(
                 yellow, frame_center, y_start, y_end, y_far, y_near, yellow_side)
@@ -340,10 +352,14 @@ def detect_lane(frame):
             return None
         lane_width = 0.5 * ((right_fit[0] - left_fit[0]) +
                             (right_fit[1] - left_fit[1]))
-        markings_bracket_vehicle = (
-            left_fit[1] < frame_center < right_fit[1]
-        )
-        if not markings_bracket_vehicle or not (0.15 * width <= lane_width <= 0.95 * width):
+        markings_bracket_vehicle = left_fit[1] < frame_center < right_fit[1]
+        # Bracketing the camera is a good way to identify the starting lane,
+        # but it is a bad recovery rule: once the car drifts across a marking,
+        # the correct pair no longer brackets the camera and the controller
+        # loses the very lane it needs to steer back into. After lane lock,
+        # retain the same ordered pair and let its signed centre error recover.
+        if ((require_bracket and not markings_bracket_vehicle) or
+                not (0.15 * width <= lane_width <= 0.95 * width)):
             return None
 
         # These are the two virtual centerline points: each is halfway between
@@ -366,13 +382,19 @@ def detect_lane(frame):
                                   y_far, y_near, 0, previous_yellow)
         white_fit = _fit_marking(white, frame_center, y_start, y_end,
                                  y_far, y_near, 0, previous_white)
-        tracked = make_candidate(yellow_side, white_side, yellow_fit, white_fit)
+        tracked = make_candidate(
+            yellow_side, white_side, yellow_fit, white_fit,
+            require_bracket=_locked_lane_sides is None)
         if tracked is not None and _previous_lane_center is not None:
             old_far, old_near = _previous_lane_center
             jump = (abs(tracked["near"] - old_near) +
                     0.35 * abs(tracked["far"] - old_far)) / tracked["width"]
-            if jump <= 0.45:
-                candidates.append(tracked)
+            # The same marking pair can shift substantially in the image as
+            # the car yaws into a tight bend. It is already anchored to the
+            # previous yellow and dashed-line fits, so a large centre jump is
+            # not by itself evidence that it became the neighbouring lane.
+            tracked["score"] += 0.5 * jump
+            candidates.append(tracked)
 
     if not candidates:
         # Keep the same yellow/divider pair through short corner occlusions.
@@ -382,14 +404,15 @@ def detect_lane(frame):
         _detection_misses += 1
         alternatives = ((-1, 1), (1, -1))
         if _locked_lane_sides is not None:
-            # Prefer the current pair through brief losses. If it remains
-            # missing through a corner, allow the other image orientation,
-            # but only a pair that brackets the camera (Task 1C rule) qualifies.
-            other = ((1, -1) if _locked_lane_sides == (-1, 1) else (-1, 1))
-            alternatives = ((_locked_lane_sides,) if _detection_misses <= 4
-                           else (_locked_lane_sides, other))
+            # The evaluation starts a fresh script for each lap, so this
+            # orientation identifies the lane selected at that lap's start.
+            # Never flip it after a corner occlusion: the opposite yellow /
+            # divider pairing is the adjacent lane, not a recovery target.
+            alternatives = (_locked_lane_sides,)
         for yellow_side, white_side in alternatives:
-            candidate = make_candidate(yellow_side, white_side)
+            candidate = make_candidate(
+                yellow_side, white_side,
+                require_bracket=_locked_lane_sides is None)
             if candidate is not None:
                 if previous_center is not None:
                     old_far, old_near = previous_center
@@ -403,12 +426,24 @@ def detect_lane(frame):
 
     if not candidates:
         _tracked_markings = None
-        fallback = _task1c_fallback(frame, yellow, white)
+        fallback = _task1c_fallback(
+            frame, yellow, white, lane_sides=_locked_lane_sides)
         if fallback is not None:
+            # Task 1C's fallback is useful when one marking is briefly
+            # occluded. Do not demand a small image-space jump here: camera
+            # bearing changes quickly on a tight bend, even when the physical
+            # lane has not changed. The persistent side lock below guards the
+            # lane identity.
             _detection_misses = 0
             fallback_sides = ((-1, 1) if fallback["lane"] == "left"
                               else (1, -1))
-            _locked_lane_sides = fallback_sides
+            if (_locked_lane_sides is not None and
+                    fallback_sides != _locked_lane_sides):
+                return {"valid": False}
+            # A fallback may recover the centre estimate; it must not redefine
+            # which lane the evaluator placed the vehicle in.
+            if _locked_lane_sides is None:
+                _locked_lane_sides = fallback_sides
             _previous_lane_center = (fallback["center_far"],
                                      fallback["center_ref"])
             _filtered_cte = fallback["cte"]
@@ -416,7 +451,7 @@ def detect_lane(frame):
             return fallback
         return {"valid": False}
 
-    relock = (_locked_lane_sides is None or _detection_misses > 4)
+    relock = _locked_lane_sides is None
     candidate = min(candidates, key=lambda item: item["score"])
     _detection_misses = 0
     if relock:
@@ -531,10 +566,11 @@ def compute_control(detection, stop_requested):
         speed = float(max(_CRUISE_SPEED * 0.20, speed))
     else:
         steering = _last_steering
-        # Keep the last lane-hold steering and creep so the camera can see
-        # beyond a brief marking loss. The persistent lane lock prevents a
-        # recovery frame from silently selecting the adjacent lane.
-        speed = _RECOVERY_SPEED
+        # Hold the last lane-hold steering through brief marking loss. Keep
+        # enough speed for the camera to regain the paint, but cap recovery so
+        # a prolonged blind bend does not become a full-speed guess.
+        speed = max(_CRUISE_SPEED * _RECOVERY_SPEED,
+                    min(_last_speed * 0.70, _CRUISE_SPEED * 0.55))
 
     _last_steering = steering
     _last_speed = speed
