@@ -1,0 +1,152 @@
+{
+    "generate": true,
+    "os_info": {
+        "name": "Windows",
+        "version": "10.0.21996",
+        "machine": "AMD64"
+    },
+    "python": "3.10.21",
+    "opencv": "5.0.0",
+    "rows": [
+        {
+            "image": "40_1.png",
+            "signs": [
+                {
+                    "label": "Speed40",
+                    "area": 1368
+                }
+            ],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        },
+        {
+            "image": "40_2.png",
+            "signs": [
+                {
+                    "label": "Speed40",
+                    "area": 4880
+                }
+            ],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        },
+        {
+            "image": "40_P_1.png",
+            "signs": [
+                {
+                    "label": "Speed40",
+                    "area": 1249
+                },
+                {
+                    "label": "Parking",
+                    "area": 2550
+                }
+            ],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        },
+        {
+            "image": "Blank_1.png",
+            "signs": [],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        },
+        {
+            "image": "H_1.png",
+            "signs": [
+                {
+                    "label": "Hospital",
+                    "area": 3945
+                }
+            ],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        },
+        {
+            "image": "Obs_1.png",
+            "signs": [],
+            "obstacle": {
+                "present": true,
+                "area": 12410
+            }
+        },
+        {
+            "image": "Obs_H_1.png",
+            "signs": [
+                {
+                    "label": "Hospital",
+                    "area": 6160
+                }
+            ],
+            "obstacle": {
+                "present": true,
+                "area": 4531
+            }
+        },
+        {
+            "image": "Obs_H_2.png",
+            "signs": [
+                {
+                    "label": "Hospital",
+                    "area": 1151
+                }
+            ],
+            "obstacle": {
+                "present": true,
+                "area": 1460
+            }
+        },
+        {
+            "image": "P_1.png",
+            "signs": [
+                {
+                    "label": "Parking",
+                    "area": 1700
+                }
+            ],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        },
+        {
+            "image": "Sc_1.png",
+            "signs": [
+                {
+                    "label": "School",
+                    "area": 2652
+                }
+            ],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        },
+        {
+            "image": "Sc_2.png",
+            "signs": [
+                {
+                    "label": "School",
+                    "area": 1621
+                }
+            ],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        }
+    ],
+    "meta": {
+        "evaluation_time": 0.4319608211517334
+    }
+}

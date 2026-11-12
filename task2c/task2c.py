@@ -19,11 +19,11 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          5761
+# Author List:      Derish Abraham, Joshua Varghese, Delvin Varghese, Reibin Chacko Thomas
 # Filename:         task2c.py
 # Functions:        parking_manoeuvre
-# Global variables: < List any global variables you add, "None" if you add none >
+# Global variables: STATE, SMOOTHED_STEERING, STOP_CONFIRM_FRAMES, TARGET_CROSSING_ANGLE, STRAIGHTEN_THRESHOLD, STRAIGHTEN_FORWARD, LAST_VALID_POSE
 
 
 ####################### IMPORT MODULES #######################
@@ -67,6 +67,17 @@ BAY_WIDTH          = 0.22    # m - the vehicle is 0.18 m across
 ##############################################################
 ############### ADD YOUR IMPLEMENTATION HERE #################
 ##############################################################
+
+# Global state variables to persist information between frames
+STATE = 'CROSSING'
+SMOOTHED_STEERING = 0.0
+STOP_CONFIRM_FRAMES = 0
+TARGET_CROSSING_ANGLE = None
+STRAIGHTEN_THRESHOLD = None
+STRAIGHTEN_FORWARD = None
+LAST_VALID_POSE = None
+
+
 
 def parking_manoeuvre(pose):
     '''
@@ -133,9 +144,77 @@ def parking_manoeuvre(pose):
     sensible is how a vehicle drives off.
     '''
 
-    # ADD YOUR CODE HERE
+    global STATE, SMOOTHED_STEERING, STOP_CONFIRM_FRAMES
+    global TARGET_CROSSING_ANGLE, STRAIGHTEN_THRESHOLD, STRAIGHTEN_FORWARD, LAST_VALID_POSE
 
-    return 0.0, 0.0, False
+    # Handle transient frames where the marker is not visible
+    if pose is None:
+        if LAST_VALID_POSE is None:
+            return 0.0, 1.0, False
+        return SMOOTHED_STEERING, 0.8, False
+
+    LAST_VALID_POSE = pose
+
+    lateral = float(pose['lateral'])
+    heading = float(pose['heading'])
+    forward = float(pose['forward'])
+
+    # Stop condition: vehicle has reached the centre of the bay (BAY_MIDDLE_FORWARD = 0.19m)
+    if forward <= BAY_MIDDLE_FORWARD:
+        STOP_CONFIRM_FRAMES += 1
+        # Hold stationary at 0.0 rad/s to bring the vehicle to a full standstill
+        if STOP_CONFIRM_FRAMES >= 3:
+            return 0.0, 0.0, True
+        return 0.0, 0.0, False
+    else:
+        STOP_CONFIRM_FRAMES = 0
+
+    # Determine bay configuration on initial frame
+    if TARGET_CROSSING_ANGLE is None:
+        # Bay 1 (further right) requires a steeper crossing and closer straightening
+        is_bay_1 = (lateral > 0.33) or (TARGET_ID == 1)
+        if is_bay_1:
+            TARGET_CROSSING_ANGLE = np.deg2rad(-39.5)
+            STRAIGHTEN_THRESHOLD = 0.018
+            STRAIGHTEN_FORWARD = 0.38
+        else:
+            TARGET_CROSSING_ANGLE = np.deg2rad(-24.0)
+            STRAIGHTEN_THRESHOLD = 0.030
+            STRAIGHTEN_FORWARD = 0.42
+
+    # Calibrated speed profile to yield ~200 simulation frames total,
+    # ensuring delta-s is never clamped in the pose estimator and stops cleanly in the middle.
+    if forward <= BAY_MIDDLE_FORWARD + 0.06:
+        speed = 0.5
+    elif forward <= BAY_MOUTH_FORWARD:
+        speed = 0.8
+    elif forward <= 0.48:
+        speed = 1.0
+    else:
+        speed = 1.2
+
+    # Movement 1 & 2 Transition:
+    # Switch from crossing to straightening once approaching the centre line or mouth
+    if STATE == 'CROSSING':
+        if lateral <= STRAIGHTEN_THRESHOLD or forward <= STRAIGHTEN_FORWARD:
+            STATE = 'STRAIGHTENING'
+
+    # Steering Law
+    if STATE == 'CROSSING':
+        # Turn and hold target angle across the road
+        err_head = TARGET_CROSSING_ANGLE - heading
+        raw_steer = 1.5 * err_head
+    else:
+        # Movement 2 & 3: Straighten up before bay mouth and follow centre line straight
+        raw_steer = -1.6 * heading - 4.0 * lateral
+
+    raw_steer = float(np.clip(raw_steer, -STEER_LIMIT, STEER_LIMIT))
+
+    # Low-pass filter on steering commands to prevent front wheel jitter/shaking
+    SMOOTHED_STEERING = 0.70 * SMOOTHED_STEERING + 0.30 * raw_steer
+
+    return float(SMOOTHED_STEERING), float(speed), False
+
 
 
 ##############################################################
