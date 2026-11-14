@@ -844,7 +844,12 @@ class MarkerPose:
     """Estimate bay-relative pose from ArUco corners using the Task 2C model."""
 
     def __init__(self):
-        self.heading = None
+        self.heading = 0.0
+        self.rho = None
+
+    def reset(self):
+        """Reset pose estimator at parking handoff, exactly like Task 2C starting state."""
+        self.heading = 0.0
         self.rho = None
 
     @staticmethod
@@ -888,15 +893,10 @@ class MarkerPose:
         first_observation = self.rho is None
         if first_observation:
             self.rho = rho_now
+            self.heading = 0.0  # Approaching down the straight, car is parallel to bays
         rho_prev = self.rho
         self.rho = 0.6 * self.rho + 0.4 * rho_now
-        if first_observation:
-            # Task 3 reaches the parking marker after driving the full route,
-            # so its approach heading is not the parallel-at-start heading
-            # assumed by the standalone Task 2C parking exercise. Initialize
-            # from a clear marker pose when available.
-            self.heading = yaw_seen if yaw_seen is not None else 0.0
-        else:
+        if not first_observation:
             ds = float(np.clip(
                 (rho_prev - self.rho) / max(math.cos(bearing), 0.3),
                 0.0, 0.01))
@@ -1230,11 +1230,14 @@ class Mission:
             if self.parking_sign_clear >= 8:
                 self.parking_sign_visible = False
 
-        # Do not switch into the parking controller on a one-frame marker
-        # sighting or a stale Parking sign. Wait until the sign was recently
-        # seen and the marker pose is both close and stable in view.
-        if (pose is not None and 0.15 <= pose["forward"] <= 1.0 and
-                self.parking_sign_age <= 60):
+        # Gate parking entry on detecting the ArUco marker from ahead down the road.
+        # In the Hard arena approach, lateral can be up to 0.95m depending on lane position.
+        # Accept forward up to 1.15m and lateral up to 1.05m so we never miss the bay.
+        valid_approach = (pose is not None and
+                          0.25 <= pose["forward"] <= 1.25 and
+                          -0.20 <= pose["lateral"] <= 1.10 and
+                          abs(pose["heading"]) <= math.radians(45.0))
+        if valid_approach and self.parking_sign_age <= 80:
             self.parking_marker_stable += 1
         else:
             self.parking_marker_stable = 0
@@ -1326,10 +1329,14 @@ class Mission:
                     return 0.0, 0.0, self.state
                 # The updated Task 2C geometry places the bay midpoint at
                 # 0.19 m forward.  If the marker disappears after the car has
-                # already reached that zone, finish from the last measured
-                # pose instead of driving through the bay indefinitely.
+                # already reached that zone, finish only if we were actually in the bay!
+                last_fwd = self.last_pose.get("forward", 1.0)
+                last_lat = self.last_pose.get("lateral", 1.0)
+                last_hdg = self.last_pose.get("heading", 1.0)
                 if (self.marker_misses >= 8 and
-                        self.last_pose.get("forward", 1.0) <= 0.22):
+                        last_fwd <= 0.22 and
+                        abs(last_lat) <= 0.08 and
+                        abs(last_hdg) <= math.radians(15.0)):
                     self.state = "DONE"
                     return 0.0, 0.0, self.state
                 # Match the updated Task 2C behavior: a missing marker frame
@@ -1345,9 +1352,13 @@ class Mission:
             heading = pose["heading"]
             forward = pose["forward"]
 
-            # Task 2C's midpoint is the evaluator's parking target. Confirm
-            # several measured frames at or beyond it before ending the run.
-            if forward <= 0.19:
+            # Task 2C's midpoint is the evaluator's parking target.
+            # Confirm vehicle is inside the bay (forward <= 0.19m) AND aligned
+            # on the bay's centre line (lateral and heading near zero).
+            in_bay = (forward <= 0.19 and
+                      abs(lateral) <= 0.08 and
+                      abs(heading) <= math.radians(15.0))
+            if in_bay:
                 self.parking_stop_confirm += 1
                 if self.parking_stop_confirm >= 3:
                     self.state = "DONE"
@@ -1358,9 +1369,14 @@ class Mission:
                 self.parking_stop_confirm = 0
 
             if self.parking_target_angle is None:
-                # The Hard scene uses the farther bay geometry from Task 2C;
-                # retain the lateral fallback for scenes whose bay is nearer.
-                if lateral > 0.33:
+                # In Task 3, after obstacle avoidance the vehicle can be in the left lane (lateral ~ 1.0m)
+                # or right lane (lateral ~ 0.4m). If far out to the left, we need an aggressive crossing
+                # angle and must not switch to straightening while still 0.5m out in the road!
+                if lateral > 0.60:
+                    self.parking_target_angle = math.radians(-42.0)
+                    self.parking_straighten_threshold = 0.040
+                    self.parking_straighten_forward = 0.32
+                elif lateral > 0.33:
                     self.parking_target_angle = math.radians(-39.5)
                     self.parking_straighten_threshold = 0.018
                     self.parking_straighten_forward = 0.38
@@ -1370,17 +1386,19 @@ class Mission:
                     self.parking_straighten_forward = 0.42
 
             if forward <= 0.25:
-                speed = 0.5
+                speed = 0.40
             elif forward <= 0.37:
-                speed = 0.8
+                speed = 0.60
             elif forward <= 0.48:
-                speed = 1.0
+                speed = 0.80
             else:
-                speed = 1.2
+                speed = 1.00
 
+            # Switch from crossing to straightening once approaching the centre line of the bay
+            # DO NOT straighten if lateral is still large (> 0.15m)!
             if (self.parking_motion == "CROSSING" and
                     (lateral <= self.parking_straighten_threshold or
-                     forward <= self.parking_straighten_forward)):
+                     (forward <= self.parking_straighten_forward and lateral <= 0.15))):
                 self.parking_motion = "STRAIGHTENING"
 
             if self.parking_motion == "CROSSING":
@@ -1427,6 +1445,8 @@ class Mission:
         speed_scale = 0.90 if self.state == "LANE_CHANGE" else 1.0
         steering, speed = self._lane_control(lane, speed_cap, now_wall, speed_scale)
         self.prev_steering = steering
+        if self.state == "LANE_CHANGE":
+            return steering, min(speed, speed_cap), self.state
         return steering, min(speed, speed_cap, self.obstacle_speed_cap), self.state
 
 
@@ -1510,14 +1530,16 @@ def _connect_and_run():
                 heading = float(lane["heading"]) if lane_valid else float("nan")
                 white_side = int(lane.get("white_side", 0)) if lane_valid else 0
                 sign_labels = ",".join(s["label"] for s in signs) or "-"
+                pose_str = ("fwd=%.2f lat=%.2f hdg=%.2f" % (pose["forward"], pose["lateral"], pose["heading"])) if pose else "None"
                 print("frames=%d state=%s lane=%s cte=%.3f heading=%.3f "
                       "white_side=%d offset=%.2f visible_signs=%s "
                       "steer=%.3f speed=%.2f obstacle_cap=%.2f "
-                      "signs=%d obstacles=%d" %
+                      "signs=%d obstacles=%d marker=%s p_stable=%d p_age=%d" %
                       (frames, state, "ok" if lane_valid else "lost", cte,
                        heading, white_side, mission.target_offset, sign_labels, steering,
                        speed, mission.obstacle_speed_cap, mission.speed_sign_count,
-                       mission.obstacles_passed),
+                       mission.obstacles_passed, pose_str, mission.parking_marker_stable,
+                       mission.parking_sign_age),
                       flush=True)
     except KeyboardInterrupt:
         print("Interrupted.")
