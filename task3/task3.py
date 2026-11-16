@@ -57,12 +57,17 @@ LANE_WIDTH_M = 0.20
 
 MAX_SPEED = 3.0
 SPEED40_LIMIT = 1.2
-BASE_SPEED = 2.0
+# Keep margin below the evaluator limit for drive-joint response transients.
+SPEED40_COMMAND = 1.05
+BASE_SPEED = 3.0
 RECOVERY_SPEED = 0.25
 LANE_LOSS_GRACE_FRAMES = 2
 LANE_CHANGE_LOSS_GRACE_FRAMES = 6
 LANE_CHANGE_OFFSET_STEP = 0.06
 LANE_CHANGE_MIN_SPEED = 0.80
+PARKING_STOP_FORWARD = 0.25  # brake 6 cm before Task 2C's bay midpoint
+PARKING_VISION_LOSS_GRACE_FRAMES = 450
+PARKING_MOTOR_SPEED_TO_MPS = 0.029 / 1.3  # Task 1B m/s at 1.3 wheel rad/s
 TASK1B_SPEED_MPS = 0.029
 TASK1B_STANLEY_K = 0.3
 TASK1B_STANLEY_SOFT = 0.05
@@ -925,6 +930,107 @@ def _find_marker(detector, frame):
     return choices[0][0].reshape(4, 2) if choices else None
 
 
+def detect_parking_bay_outline(frame):
+    """Find the camera-visible yellow rectangle around the parking surface.
+
+    The outline supplies low-speed steering and a coarse range backup. A
+    partial or ambiguous painted outline is rejected rather than treated as a
+    parking target.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    yellow = cv2.inRange(hsv, YELLOW_LOWER, YELLOW_UPPER)
+    yellow = cv2.morphologyEx(yellow, cv2.MORPH_CLOSE,
+                              np.ones((5, 5), np.uint8))
+    h, w = frame.shape[:2]
+    gray_surface = ((hsv[:, :, 1] < 110) & (hsv[:, :, 2] > 55) &
+                    (hsv[:, :, 2] < 225)).astype(np.uint8) * 255
+    gray_surface = cv2.morphologyEx(gray_surface, cv2.MORPH_CLOSE,
+                                    np.ones((5, 5), np.uint8))
+    contours, _ = cv2.findContours(gray_surface, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+    yellow_near = cv2.dilate(yellow, np.ones((5, 5), np.uint8))
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < max(500.0, 0.002 * w * h) or area > 0.40 * w * h:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter < 60:
+            continue
+        polygon = cv2.approxPolyDP(contour, 0.04 * perimeter, True)
+        if len(polygon) != 4 or not cv2.isContourConvex(polygon):
+            continue
+        points = polygon.reshape(4, 2).astype(np.float32)
+        rect = cv2.minAreaRect(points)
+        rw, rh = rect[1]
+        if min(rw, rh) < 18 or max(rw, rh) / min(rw, rh) > 5.0:
+            continue
+
+        interior = np.zeros((h, w), np.uint8)
+        cv2.fillConvexPoly(interior, points.astype(np.int32), 255)
+        interior = cv2.erode(interior, np.ones((9, 9), np.uint8))
+        inside = interior != 0
+        if int(inside.sum()) < 500:
+            continue
+        gray_fraction = float(gray_surface[inside].mean() / 255.0)
+        # The parking surface is gray; requiring yellow support on its four
+        # edges distinguishes it from roofs, road shoulders, and lane shapes.
+        if gray_fraction < 0.48:
+            continue
+
+        center = points.mean(axis=0)
+        order = np.argsort(np.arctan2(points[:, 1] - center[1],
+                                     points[:, 0] - center[0]))
+        points = points[order]
+        by_y = np.argsort(points[:, 1])
+        far = points[by_y[:2]].mean(axis=0)
+        near = points[by_y[2:]].mean(axis=0)
+        # Pure pursuit to a point inside the bay, biased toward its mouth so
+        # the controller does not aim through the far wall when close.
+        target = 0.55 * near + 0.45 * far
+        pixel_error = (float(target[0]) - w / 2.0) / max(FOCAL_PX, 1.0)
+        bearing = math.atan(pixel_error)
+        axis_error = math.atan2(float(far[0] - near[0]),
+                                max(float(near[1] - far[1]), 1.0))
+        near_width = float(np.linalg.norm(points[by_y[2]] - points[by_y[3]]))
+        far_width = float(np.linalg.norm(points[by_y[0]] - points[by_y[1]]))
+        width_px = 0.5 * (near_width + far_width)
+        # Task 2C specifies a 22 cm bay width. Its projected width gives a
+        # coarse range when the marker is occluded. Correct for the camera's
+        # down tilt and height above the road; this is only a low-speed backup
+        # stop estimate, never a substitute for a fresh ArUco pose.
+        z_cam = FOCAL_PX * 0.22 / max(width_px, 1.0)
+        forward = ((z_cam - 0.176 * math.sin(CAMERA_PITCH)) /
+                   max(math.cos(CAMERA_PITCH), 0.1) + CAMERA_AHEAD)
+        bay_center = points.mean(axis=0)
+        lateral = ((float(bay_center[0]) - w / 2.0) * z_cam /
+                   max(FOCAL_PX, 1.0))
+        if not (0.0 <= forward <= 1.5):
+            continue
+        edge_support = []
+        for index in range(4):
+            a = points[index].astype(int)
+            b = points[(index + 1) % 4].astype(int)
+            line = np.zeros((h, w), np.uint8)
+            cv2.line(line, tuple(a), tuple(b), 255, 1)
+            pixels = line != 0
+            if pixels.any():
+                edge_support.append(float((yellow_near[pixels] > 0).mean()))
+        support = float(np.mean(edge_support)) if edge_support else 0.0
+        if support < 0.25 or min(edge_support, default=0.0) < 0.08:
+            continue
+        score = area * gray_fraction * support
+        candidates.append((score, bearing, axis_error, gray_fraction,
+                           forward, lateral))
+    if not candidates:
+        return None
+    _, bearing, axis_error, gray_fraction, forward, lateral = max(
+        candidates, key=lambda item: item[0])
+    return {"bearing": float(bearing), "axis_error": float(axis_error),
+            "confidence": float(gray_fraction), "forward": float(forward),
+            "lateral": float(lateral)}
+
+
 def _read_frame(sim, handles):
     sim.handleVisionSensor(handles["camera"])
     raw, resolution = sim.getVisionSensorImg(handles["camera"], 0)
@@ -970,6 +1076,7 @@ class Mission:
         self.stop_started = None
         self.stop_stable_frames = 0
         self.stop_complete_time = None
+        self.hospital_close_frames = 0
         self.speed_zone = False
         self.speed_sign_count = 0
         self.speed_sign_visible = False
@@ -1002,12 +1109,15 @@ class Mission:
         self.lane_misses = 0
         self.last_pose = None
         self.marker_misses = 0
+        self.parking_outline_seen = False
+        self.parking_outline_estimate = None
         self.parked_frames = 0
         # Task 2C's staged bay approach, kept per mission rather than in
         # module globals because Task 3 may be evaluated more than once in a
         # Python process.
         self.parking_motion = "CROSSING"
         self.parking_smoothed_steering = 0.0
+        self.parking_odom_time = None
         self.parking_stop_confirm = 0
         self.parking_target_angle = None
         self.parking_straighten_threshold = None
@@ -1068,13 +1178,13 @@ class Mission:
         # noisy at sharp corners, so cap speed progressively instead of
         # keeping cruise speed until the detector fails.
         curve_speed = BASE_SPEED * max(
-            0.25, 1.0 - 0.80 * abs(self.filtered_heading))
+            0.50, 1.0 - 0.45 * abs(self.filtered_heading))
         speed = min(speed, curve_speed)
         if self.state == "LANE_CHANGE":
             speed = max(LANE_CHANGE_MIN_SPEED, speed) * speed_scale
         else:
-            speed = min(speed, BASE_SPEED * max(0.20,
-                                                1.0 - 1.5 * abs(self.filtered_cte)))
+            speed = min(speed, BASE_SPEED * max(0.25,
+                                                1.0 - 1.0 * abs(self.filtered_cte)))
             speed = max(BASE_SPEED * 0.20, speed) * speed_scale
         speed = min(float(speed), speed_cap)
         self.last_speed = speed
@@ -1159,26 +1269,41 @@ class Mission:
             for i, track in enumerate(self.obstacle_tracks):
                 if i in matched:
                     continue
-                scale = max(36.0, 0.12 * IMG_H, 0.7 * max(bh, track["h"]))
+                # Track a physical obstacle through brief contour gaps and
+                # perspective growth. The older tight gate split one car
+                # into many tracks and inflated the passed count.
+                scale = max(64.0, 0.18 * IMG_H,
+                            1.25 * max(bh, track["h"]))
                 distance = math.hypot((cx - track["x"]) / 1.4,
                                       cy - track["y"])
                 if distance < scale and distance < best_d:
                     best_i, best_d = i, distance
             if best_i is None:
                 self.obstacle_tracks.append({"x": cx, "y": cy, "w": bw,
-                                             "h": bh, "missing": 0})
+                                             "h": bh, "missing": 0,
+                                             "seen": 1,
+                                             "max_bottom": cy + bh / 2.0})
                 matched.add(len(self.obstacle_tracks) - 1)
             else:
                 track = self.obstacle_tracks[best_i]
                 track.update({"x": cx, "y": cy, "w": bw, "h": bh,
-                              "missing": 0})
+                              "missing": 0,
+                              "seen": track.get("seen", 1) + 1,
+                              "max_bottom": max(
+                                  track.get("max_bottom", cy + bh / 2.0),
+                                  cy + bh / 2.0)})
                 matched.add(best_i)
         survivors = []
         for i, track in enumerate(self.obstacle_tracks):
             if i not in matched:
                 track["missing"] += 1
-            if track["missing"] >= 30:
-                self.obstacles_passed += 1
+            if track["missing"] >= 55:
+                # Disappearance alone does not prove the vehicle passed it:
+                # require repeated detections and that it moved near the
+                # bottom of the camera first.
+                if (track.get("seen", 0) >= 3 and
+                        track.get("max_bottom", 0) >= 0.55 * IMG_H):
+                    self.obstacles_passed += 1
             else:
                 survivors.append(track)
         self.obstacle_tracks = survivors
@@ -1214,7 +1339,8 @@ class Mission:
                 self.speed_sign_visible = True
         else:
             self.speed_sign_clear += 1
-            if self.speed_sign_clear >= 20:
+            # A brief detector gap must not make the first board count twice.
+            if self.speed_sign_clear >= 60:
                 self.speed_sign_visible = False
 
         parking_sign = any(s["label"] == "Parking" for s in signs)
@@ -1230,9 +1356,8 @@ class Mission:
             if self.parking_sign_clear >= 8:
                 self.parking_sign_visible = False
 
-        # Gate parking entry on detecting the ArUco marker from ahead down the road.
-        # In the Hard arena approach, lateral can be up to 0.95m depending on lane position.
-        # Accept forward up to 1.15m and lateral up to 1.05m so we never miss the bay.
+        # Start parking from the calibrated Task 2C handoff range, once the
+        # marker pose is stable and the preceding Task 3 jobs are complete.
         valid_approach = (pose is not None and
                           0.25 <= pose["forward"] <= 1.25 and
                           -0.20 <= pose["lateral"] <= 1.10 and
@@ -1252,11 +1377,11 @@ class Mission:
 
         self._track_obstacles(obstacles)
         if (self.state == "FOLLOW" and self.lane_change_committed and
-                self.frame_index >= self.lane_change_rearm_frame and
-                self.obstacles_passed > self.lane_change_passed_baseline):
-            # A later obstacle may require another lane change. Re-arm only
-            # after the obstacle that triggered the previous manoeuvre has
-            # left the camera tracks and a cooldown has elapsed.
+                self.frame_index >= self.lane_change_rearm_frame):
+            # Re-arm once the adjacent lane has been acquired or the virtual
+            # lane offset reaches one lane spacing. Waiting for an obstacle
+            # contour to disappear can leave the car creeping in front of a
+            # later obstacle.
             self.lane_change_committed = False
         if self.state == "LANE_CHANGE":
             self.lane_change_frames += 1
@@ -1281,19 +1406,68 @@ class Mission:
                         self.lane_change_direction,
                         min(0.0, self.lane_change_direction),
                         max(0.0, self.lane_change_direction)))
-        self._consider_lane_change(lane, obstacles)
+            # If neither the locked pair nor the desired adjacent pair is
+            # visible through a corner, relock from the current camera image
+            # while preserving continuity with the last lane centre. The old
+            # behavior retried only the target pair, then commanded zero speed
+            # forever after six misses while remaining in LANE_CHANGE.
+            if ((not lane or "cte" not in lane) and
+                    self.lane_misses >= 2 and
+                    self.lane_change_frames % 4 == 0):
+                recovered = self.lanes.reacquire_current_lane(frame)
+                if recovered and "cte" in recovered:
+                    lane = recovered
+                    self.lane_misses = 0
+                    if (self.target_lane_white_side is not None and
+                            int(recovered.get("white_side", 0)) ==
+                            self.target_lane_white_side):
+                        self.lane_change_using_target = True
+                        self.target_offset = 0.0
+                    else:
+                        self.target_offset = float(np.clip(
+                            self.target_offset + LANE_CHANGE_OFFSET_STEP *
+                            self.lane_change_direction,
+                            min(0.0, self.lane_change_direction),
+                            max(0.0, self.lane_change_direction)))
+                    print("lane_recovery frame=%d white_side=%s offset=%.2f" %
+                          (self.frame_index, recovered.get("white_side"),
+                           self.target_offset), flush=True)
+        # Obstacles may only initiate lane changes while following the road.
+        # Letting this run in PARKING/HOSPITAL_STOP allowed a red vehicle or
+        # sign fragment to overwrite those mission states (observed as
+        # PARKING->LANE_CHANGE at frame 1610), abandoning the bay maneuver.
+        if self.state in ("FOLLOW", "LANE_CHANGE"):
+            self._consider_lane_change(lane, obstacles)
+        else:
+            self.obstacle_speed_cap = MAX_SPEED
 
         hospital = [s for s in signs if s["label"] == "Hospital"]
-        if (not self.hospital_done and hospital and self.state == "FOLLOW"):
-            # Apparent sign height provides a camera-distance cue. Trigger on
-            # size and image position, never a world pose or elapsed travel time.
-            _, sy, _, sh = max((s["bbox"] for s in hospital),
-                               key=lambda b: b[3])
-            if sh >= 0.075 * IMG_H and sy + sh >= 0.38 * IMG_H:
+        hospital_approach = False
+        if not self.hospital_done and self.state == "FOLLOW" and hospital:
+            # The previous threshold stopped 1.12 m from the pickup. Require
+            # a closer, repeated sign observation, based only on image size
+            # and position; begin slowing earlier as the sign approaches.
+            close_signs = [s for s in hospital
+                           if not s.get("clipped", False)
+                           and s["bbox"][3] >= 0.08 * IMG_H
+                           and s["bbox"][1] + s["bbox"][3] >= 0.48 * IMG_H]
+            self.hospital_close_frames = (
+                self.hospital_close_frames + 1 if close_signs else 0)
+            hospital_approach = any(
+                not s.get("clipped", False)
+                and s["bbox"][3] >= 0.055 * IMG_H
+                and s["bbox"][1] + s["bbox"][3] >= 0.32 * IMG_H
+                for s in hospital)
+            if self.hospital_close_frames >= 2:
                 self.state = "HOSPITAL_STOP"
                 self.stop_started = None
+                self.hospital_close_frames = 0
+        else:
+            self.hospital_close_frames = 0
 
-        speed_cap = SPEED40_LIMIT if self.speed_zone else MAX_SPEED
+        speed_cap = SPEED40_COMMAND if self.speed_zone else MAX_SPEED
+        if hospital_approach and self.state == "FOLLOW":
+            speed_cap = min(speed_cap, 0.80)
         if self.state == "HOSPITAL_STOP":
             stable = self._stationary(frame)
             self.stop_stable_frames = self.stop_stable_frames + 1 if stable else 0
@@ -1308,55 +1482,77 @@ class Mission:
 
         if self.state == "PARKING":
             if pose is None:
-                # A single missing marker frame is expected during the bay
-                # crossing. Continue with the last filtered command, as in
-                # the updated Task 2C controller, but never declare parking
-                # without a measured pose.
-                parking_cues = [s for s in signs
-                                if s["label"] == "Parking"]
-                if parking_cues:
-                    cue = max(parking_cues, key=lambda item: item["area"])
-                    cue_x = float(cue["center"][0])
-                    right_bearing = math.atan2(
-                        cue_x - IMG_W / 2.0, FOCAL_PX)
-                    steering = float(np.clip(-1.2 * right_bearing,
-                                             -0.42, 0.42))
-                    self.prev_steering = steering
-                    return steering, min(0.24, speed_cap), self.state
-
                 self.marker_misses += 1
                 if self.last_pose is None:
                     return 0.0, 0.0, self.state
-                # The updated Task 2C geometry places the bay midpoint at
-                # 0.19 m forward.  If the marker disappears after the car has
-                # already reached that zone, finish only if we were actually in the bay!
                 last_fwd = self.last_pose.get("forward", 1.0)
-                last_lat = self.last_pose.get("lateral", 1.0)
-                last_hdg = self.last_pose.get("heading", 1.0)
-                if (self.marker_misses >= 8 and
-                        last_fwd <= 0.22 and
-                        abs(last_lat) <= 0.08 and
-                        abs(last_hdg) <= math.radians(15.0)):
-                    self.state = "DONE"
-                    return 0.0, 0.0, self.state
-                # Match the updated Task 2C behavior: a missing marker frame
-                # is not a reason to freeze permanently.  Continue with the
-                # filtered, bounded command until the marker is reacquired;
-                # final completion still requires a fresh measured pose.
-                return (self.parking_smoothed_steering,
-                        min(0.8, speed_cap), self.state)
+                outline = detect_parking_bay_outline(frame)
+                self.parking_outline_seen = outline is not None
+                self.parking_outline_estimate = outline
+                if outline is not None:
+                    outline_in_bay = (
+                        outline["forward"] <= PARKING_STOP_FORWARD and
+                        abs(outline["lateral"]) <= 0.05 and
+                        abs(outline["axis_error"]) <= math.radians(15.0))
+                    self.parking_stop_confirm = (
+                        self.parking_stop_confirm + 1 if outline_in_bay else 0)
+                    if self.parking_stop_confirm >= 3:
+                        self.state = "DONE"
+                        return 0.0, 0.0, self.state
+                if outline is not None:
+                    # Use the camera-measured slot estimate as soon as the
+                    # painted bay is available again.
+                    pose = {"forward": outline["forward"],
+                            "lateral": outline["lateral"],
+                            "heading": outline["axis_error"],
+                            "bearing": outline["bearing"]}
+                    self.last_pose = pose
+                    self.parking_odom_time = sim_time
+                else:
+                    if self.marker_misses >= PARKING_VISION_LOSS_GRACE_FRAMES:
+                        self.prev_steering = 0.0
+                        return 0.0, 0.0, self.state
+                    # Continue Task 2C's staged manoeuvre after the marker
+                    # passes under the camera. Estimate only motion caused by
+                    # our commanded wheel speed; never read simulator poses.
+                    previous = self.last_pose
+                    if self.parking_odom_time is None:
+                        self.parking_odom_time = sim_time
+                    dt = float(np.clip(sim_time - self.parking_odom_time,
+                                       0.0, 0.10))
+                    self.parking_odom_time = sim_time
+                    if last_fwd <= 0.25:
+                        odom_speed = 0.50
+                    elif last_fwd <= 0.37:
+                        odom_speed = 0.80
+                    elif last_fwd <= 0.48:
+                        odom_speed = 1.00
+                    else:
+                        odom_speed = 1.20
+                    ds = PARKING_MOTOR_SPEED_TO_MPS * odom_speed * dt
+                    hdg = float(previous.get("heading", 0.0))
+                    hdg += math.tan(self.parking_smoothed_steering) / WHEELBASE * ds
+                    pose = {
+                        "forward": max(0.0, last_fwd - ds * math.cos(hdg)),
+                        "lateral": float(previous.get("lateral", 0.0)) +
+                                   ds * math.sin(hdg),
+                        "heading": hdg,
+                        "bearing": float(previous.get("bearing", 0.0)),
+                    }
+                    self.last_pose = pose
             else:
                 self.last_pose = pose
                 self.marker_misses = 0
+                self.parking_odom_time = sim_time
             lateral = pose["lateral"]
             heading = pose["heading"]
             forward = pose["forward"]
 
-            # Task 2C's midpoint is the evaluator's parking target.
-            # Confirm vehicle is inside the bay (forward <= 0.19m) AND aligned
-            # on the bay's centre line (lateral and heading near zero).
-            in_bay = (forward <= 0.19 and
-                      abs(lateral) <= 0.08 and
+            # Brake early, 6 cm before Task 2C's bay midpoint. That leaves room
+            # for actuator coast while keeping the vehicle inside the scored
+            # 20 cm by 10 cm parking patch.
+            in_bay = (forward <= PARKING_STOP_FORWARD and
+                      abs(lateral) <= 0.05 and
                       abs(heading) <= math.radians(15.0))
             if in_bay:
                 self.parking_stop_confirm += 1
@@ -1369,14 +1565,12 @@ class Mission:
                 self.parking_stop_confirm = 0
 
             if self.parking_target_angle is None:
-                # In Task 3, after obstacle avoidance the vehicle can be in the left lane (lateral ~ 1.0m)
-                # or right lane (lateral ~ 0.4m). If far out to the left, we need an aggressive crossing
-                # angle and must not switch to straightening while still 0.5m out in the road!
-                if lateral > 0.60:
-                    self.parking_target_angle = math.radians(-42.0)
-                    self.parking_straighten_threshold = 0.040
-                    self.parking_straighten_forward = 0.32
-                elif lateral > 0.33:
+                # Match Task 2C's calibrated two-stage manoeuvre. The right
+                # bay uses a held -39.5 degree crossing angle until the car is
+                # near the bay centreline or the marker is 0.38 m ahead.
+                # Do not straighten at the parking-state handoff: that can be
+                # almost a metre before the bay and skips the crossing.
+                if lateral > 0.33:
                     self.parking_target_angle = math.radians(-39.5)
                     self.parking_straighten_threshold = 0.018
                     self.parking_straighten_forward = 0.38
@@ -1386,29 +1580,39 @@ class Mission:
                     self.parking_straighten_forward = 0.42
 
             if forward <= 0.25:
-                speed = 0.40
+                speed = 0.50
             elif forward <= 0.37:
-                speed = 0.60
-            elif forward <= 0.48:
                 speed = 0.80
-            else:
+            elif forward <= 0.48:
                 speed = 1.00
+            else:
+                speed = 1.20
 
-            # Switch from crossing to straightening once approaching the centre line of the bay
-            # DO NOT straighten if lateral is still large (> 0.15m)!
+            # Match the Task 2C transition: straighten when the vehicle is
+            # near the bay centreline OR reaches the calibrated forward
+            # handoff. Requiring small lateral error before switching made
+            # the outer-lane approach hold its crossing angle until the
+            # marker was nearly underneath the camera, then lose the marker.
             if (self.parking_motion == "CROSSING" and
                     (lateral <= self.parking_straighten_threshold or
-                     (forward <= self.parking_straighten_forward and lateral <= 0.15))):
+                     forward <= self.parking_straighten_forward)):
                 self.parking_motion = "STRAIGHTENING"
 
             if self.parking_motion == "CROSSING":
                 raw_steer = 1.5 * (self.parking_target_angle - heading)
             else:
-                raw_steer = -1.6 * heading - 4.0 * lateral
+                # Use stronger centreline correction for the last few
+                # centimetres, after the heading has mostly straightened.
+                # At larger offsets keep the lateral term modest so it does
+                # not saturate steering and swing the vehicle across the bay.
+                lateral_gain = 4.0 if abs(lateral) <= 0.25 else 1.5
+                raw_steer = -2.0 * heading - lateral_gain * lateral
             raw_steer = float(np.clip(raw_steer,
                                       -STEER_LIMIT, STEER_LIMIT))
+            smoothing = 0.50 if forward <= 0.30 else 0.30
             self.parking_smoothed_steering = (
-                0.70 * self.parking_smoothed_steering + 0.30 * raw_steer)
+                (1.0 - smoothing) * self.parking_smoothed_steering +
+                smoothing * raw_steer)
             self.prev_steering = self.parking_smoothed_steering
             return (float(self.parking_smoothed_steering),
                     min(float(speed), speed_cap), self.state)
@@ -1431,12 +1635,12 @@ class Mission:
                     if self.lane_change_using_target:
                         self.state = "FOLLOW"
                         self.lane_change_direction = 0.0
-                        self.lane_change_rearm_frame = self.frame_index + 90
+                        self.lane_change_rearm_frame = self.frame_index + 20
                     else:
                         if abs(self.target_offset) >= 0.85:
                             self.state = "FOLLOW"
                             self.lane_change_direction = 0.0
-                            self.lane_change_rearm_frame = self.frame_index + 90
+                            self.lane_change_rearm_frame = self.frame_index + 20
                         else:
                             self.lane_change_good = 0
             else:
@@ -1516,6 +1720,7 @@ def _connect_and_run():
                     mission.marker_misses = 0
                     mission.parking_motion = "CROSSING"
                     mission.parking_smoothed_steering = 0.0
+                    mission.parking_odom_time = sim.getSimulationTime()
                     mission.parking_stop_confirm = 0
                     mission.parking_target_angle = None
                     mission.parking_straighten_threshold = None
@@ -1530,16 +1735,34 @@ def _connect_and_run():
                 heading = float(lane["heading"]) if lane_valid else float("nan")
                 white_side = int(lane.get("white_side", 0)) if lane_valid else 0
                 sign_labels = ",".join(s["label"] for s in signs) or "-"
+                hospital_boxes = [s["bbox"] for s in signs
+                                  if s["label"] == "Hospital"]
+                hospital_box = (" Hbox=" + ";".join(
+                    "%d,%d,%d,%d" % box for box in hospital_boxes)
+                    if hospital_boxes else "")
+                bay = mission.parking_outline_estimate
+                bay_summary = ("none" if bay is None else
+                               "fwd=%.2f lat=%.2f axis=%.2f" %
+                               (bay["forward"], bay["lateral"],
+                                bay["axis_error"]))
+                parking_est = mission.last_pose if state == "PARKING" else None
+                estimate_summary = ("none" if parking_est is None else
+                                    "fwd=%.2f lat=%.2f hdg=%.2f" %
+                                    (parking_est["forward"],
+                                     parking_est["lateral"],
+                                     parking_est["heading"]))
                 pose_str = ("fwd=%.2f lat=%.2f hdg=%.2f" % (pose["forward"], pose["lateral"], pose["heading"])) if pose else "None"
                 print("frames=%d state=%s lane=%s cte=%.3f heading=%.3f "
                       "white_side=%d offset=%.2f visible_signs=%s "
                       "steer=%.3f speed=%.2f obstacle_cap=%.2f "
-                      "signs=%d obstacles=%d marker=%s p_stable=%d p_age=%d" %
+                      "signs=%d obstacles=%d marker=%s p_stable=%d p_age=%d "
+                      "phase=%s est=%s bay=%s%s" %
                       (frames, state, "ok" if lane_valid else "lost", cte,
                        heading, white_side, mission.target_offset, sign_labels, steering,
                        speed, mission.obstacle_speed_cap, mission.speed_sign_count,
                        mission.obstacles_passed, pose_str, mission.parking_marker_stable,
-                       mission.parking_sign_age),
+                       mission.parking_sign_age, mission.parking_motion,
+                       estimate_summary, bay_summary, hospital_box),
                       flush=True)
     except KeyboardInterrupt:
         print("Interrupted.")
